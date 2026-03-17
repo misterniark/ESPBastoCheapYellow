@@ -54,6 +54,7 @@
 #define SENSOR_READ_MS     2000  // 2s
 #define THERMOSTAT_EVAL_MS 60000 // 60s
 #define SENSOR_ERROR_TIMEOUT_MS 300000 // 5 minutes (5 * 60 * 1000)
+#define SENSOR_ALERT_COOLDOWN_MS 60000 // 60s avant de réafficher l'alerte capteur
 
 // Default Settings
 #define DEFAULT_SETPOINT   20.0f
@@ -107,14 +108,25 @@ enum ESPNowResponse : uint8_t {
 
 enum OperatingMode : uint8_t {
     MODE_NONE = 0,
-    MODE_A_THERMOSTAT = 1, // Thermostat Hystérésis
-    MODE_B_TIMER = 2,      // Minuteur
-    MODE_C_SETPOINT = 3    // Consigne Simple
+    MODE_A_THERMOSTAT = 1,
+    MODE_B_TIMER = 2,
+    MODE_C_SETPOINT = 3
+};
+
+enum ScreenView : uint8_t {
+    VIEW_MENU,
+    VIEW_MODE_A,
+    VIEW_MODE_B,
+    VIEW_MODE_C,
+    VIEW_ALERT_CONN,
+    VIEW_ALERT_SENSOR
 };
 
 struct AppState {
     OperatingMode currentMode;
+    OperatingMode lastSelectedMode;
     bool isHeating;
+    bool heatingRequested;
     bool isLocked;
     bool relayConnected;
     uint8_t pingFailures;
@@ -123,16 +135,20 @@ struct AppState {
     float currentHumidity;
     bool sensorError;
     uint32_t sensorErrorStartTime;
+    uint32_t sensorAlertAckedTime;
 
     // Settings
     float setpoint;
     float hysteresis;
     uint16_t timerMinutes;
     uint16_t timerRemainingSecs;
+    bool modeStopPending;
+    ScreenView modeStopView;
     
     // UI State
     bool screenAwake;
     uint32_t lastActivityTime;
+    bool forceEval;
 };
 
 extern AppState state;
@@ -142,18 +158,33 @@ extern AppState state;
 #define COLOR_BG        0x0821 // Fond anthracite très sombre
 #define COLOR_TEXT      0x07FF // Texte cyan clair
 #define COLOR_ACCENT    0xFC00 // Boutons action orange/ambre
-#define COLOR_ON        0xF800 // Rouge chaud / Orange feu
+#define COLOR_ON        0xFD20 // Orange chaud (distinct de COLOR_ALERT)
 #define COLOR_OFF       0x7BEF // Gris sombre
 #define COLOR_OK        0x07E0 // Vert / Cyan
 #define COLOR_ALERT     0xF800 // Rouge de danger
 #define COLOR_LOCKED    0xFFE0 // Jaune / Ambre
+#define COLOR_HEADER_BG 0x10A2 // Fond header sombre (20,20,20)
+#define COLOR_BTN_BG    0x18E3 // Fond bouton sombre (30,30,30)
+#define COLOR_ALERT_BG  0x2800 // Fond alerte rouge sombre (40,0,0)
 
-// --- FUNCTION PROTOTYPES POUR LES SOUS-MODULES ---
-// Déclarations pour l'orchestration dans main.cpp
+// --- TOUCH CALIBRATION ---
+#define TOUCH_MIN_X 300
+#define TOUCH_MAX_X 3800
+#define TOUCH_MIN_Y 300
+#define TOUCH_MAX_Y 3800
+
+// --- DEBOUNCED SETTINGS SAVE ---
+#define SETTINGS_SAVE_DELAY_MS 3000
+
+// --- FUNCTION PROTOTYPES ---
 void display_ui_init();
 void display_ui_loop();
 void display_ui_wake();
 void display_ui_sleep();
+void display_ui_show_sleep_hint();
+bool display_ui_sleep_hint_active();
+bool display_ui_sleep_hint_expired();
+void display_ui_cancel_sleep_hint();
 
 void touch_ui_init();
 void touch_ui_loop();
@@ -163,4 +194,14 @@ void sensors_loop();
 
 void espnow_link_init();
 void espnow_link_loop();
-void espnow_send_command(ESPNowCommand cmd);
+bool espnow_send_command(ESPNowCommand cmd);
+
+void change_view(ScreenView new_view);
+void saveSettings();
+void loadSettings();
+void markSettingsDirty();
+bool request_mode_stop(ScreenView nextView);
+void finalize_mode_stop();
+void cancel_mode_stop();
+
+extern ScreenView current_view;

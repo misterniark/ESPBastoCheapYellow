@@ -7,26 +7,6 @@
 SPIClass touchSpi(VSPI); // Using VSPI for the touch driver bus
 XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 
-// Enum pour eviter header cyclique ou l'inclure si dispo
-enum ScreenView { 
-    VIEW_MENU, 
-    VIEW_MODE_A, 
-    VIEW_MODE_B, 
-    VIEW_MODE_C, 
-    VIEW_ALERT_CONN, 
-    VIEW_ALERT_SENSOR 
-};
-
-extern void change_view(ScreenView view); // Definie dans display_ui.cpp
-extern void saveSettings();       // main.cpp
-
-// Dimensions calibration ecran touch "Brut" XPT2046
-// Ces valeurs dependent de l'ecran exact mais standards generalement:
-#define TOUCH_MIN_X 300
-#define TOUCH_MAX_X 3800
-#define TOUCH_MIN_Y 300
-#define TOUCH_MAX_Y 3800
-
 uint32_t last_touch_time = 0;
 bool is_touch_down = false;
 
@@ -45,9 +25,11 @@ void touch_ui_init() {
 void touch_ui_loop() {
     // Anti-rebond et frequence de test (toutes les 50ms min)
     uint32_t now = millis();
+    bool touch_active = ts.touched();
 
-    // Verifier ISR pin si activee (efficace pour eviter requetes SPI bloquantes)
-    if (ts.tirqTouched() || ts.touched()) {
+    // On se base sur l'etat tactile reel, pas sur l'IRQ seule, sinon
+    // is_touch_down peut rester bloque a true si la ligne IRQ reste active.
+    if (touch_active) {
         if (!is_touch_down && (now - last_touch_time > 150)) {
             // Un appui detecte !
             is_touch_down = true;
@@ -55,12 +37,16 @@ void touch_ui_loop() {
             
             // 1. Reveiller l'ecran s'il dort !
             if (!state.screenAwake) {
-                extern void display_ui_wake();
                 display_ui_wake();
                 return; // Action consommee just pour reveiller.
             }
             
             state.lastActivityTime = now; // MAJ de l'inactivite
+
+            if (display_ui_sleep_hint_active()) {
+                display_ui_cancel_sleep_hint();
+                return; // Le hint de veille consomme le toucher.
+            }
 
             // Si verouille, on ignore tout (le clic reaffiche juste l'ecran et reset lastActivityTime)
             if (state.isLocked) {
@@ -79,15 +65,13 @@ void touch_ui_loop() {
             tx = constrain(tx, 0, 320);
             ty = constrain(ty, 0, 240);
             
-            extern int current_view; // Hack access pour reduire fichiers partages
-            
             // ALERTS
             if (current_view == VIEW_ALERT_CONN || current_view == VIEW_ALERT_SENSOR) { // alerts CONN ou SENSOR
                 if (is_in_rect(tx, ty, 90, 140, 140, 40)) { // Bouton OK
                     // Acquitter
-                    if (current_view == VIEW_ALERT_CONN) state.pingFailures = 0; // force reset
-                    if (current_view == VIEW_ALERT_SENSOR) state.sensorError = false; 
-                    change_view(VIEW_MENU); // View Menu
+                    if (current_view == VIEW_ALERT_CONN) state.pingFailures = 0;
+                    if (current_view == VIEW_ALERT_SENSOR) state.sensorAlertAckedTime = millis();
+                    change_view(VIEW_MENU);
                 }
                 return;
             }
@@ -103,37 +87,49 @@ void touch_ui_loop() {
             // --- BOTTOM BAR SUR LES AUTRES VUES ---
             // Bouton retour a gauche (10, 190, 140, 40)
             if (is_in_rect(tx, ty, 10, 190, 140, 40)) {
-                // Return arrete le chauffage si actif (parfois recommande)
-                // Ou non dependant choix ux. Faisons le revenir au mode NULL.
-                if (state.isHeating) {
-                    extern void espnow_send_command(ESPNowCommand cmd); // hack cmd include
-                    espnow_send_command(CMD_HEAT_OFF); // CMD_HEAT_OFF = 2
-                    state.isHeating = false;
+                if (state.heatingRequested || state.isHeating) {
+                    request_mode_stop(VIEW_MENU);
+                } else {
+                    state.currentMode = MODE_NONE;
+                    state.timerRemainingSecs = 0;
+                    saveSettings();
+                    change_view(VIEW_MENU);
                 }
-                state.currentMode = MODE_NONE; // MODE_NONE
-                saveSettings();
-                change_view(VIEW_MENU);
                 return;
             }
             
             // Bouton Action (Start/Stop) a droite (170, 190, 140, 40)
             if (is_in_rect(tx, ty, 170, 190, 140, 40)) {
-                extern void espnow_send_command(ESPNowCommand cmd);
-                
-                if (state.isHeating) {
-                    espnow_send_command(CMD_HEAT_OFF); // HEAT_OFF
-                    state.isHeating = false;
-                    state.currentMode = MODE_NONE;
-                    saveSettings();
-                } else {
-                    espnow_send_command(CMD_HEAT_ON); // HEAT_ON
-                    state.isHeating = true;
-                    if (current_view == VIEW_MODE_A) state.currentMode = MODE_A_THERMOSTAT;
-                    if (current_view == VIEW_MODE_B) { 
-                        state.currentMode = MODE_B_TIMER;
-                        state.timerRemainingSecs = state.timerMinutes * 60;
+                if (state.currentMode != MODE_NONE) {
+                    if (state.heatingRequested || state.isHeating) {
+                        request_mode_stop(current_view);
+                    } else {
+                        state.currentMode = MODE_NONE;
+                        state.timerRemainingSecs = 0;
+                        saveSettings();
                     }
-                    if (current_view == VIEW_MODE_C) state.currentMode = MODE_C_SETPOINT;
+                } else {
+                    if (!state.relayConnected) {
+                        Serial.println("[Touch] DEMARRER ignore: relais non connecte.");
+                        return;
+                    }
+
+                    if (current_view == VIEW_MODE_B) {
+                        if (espnow_send_command(CMD_HEAT_ON)) {
+                            state.heatingRequested = true;
+                            state.currentMode = MODE_B_TIMER;
+                            state.lastSelectedMode = MODE_B_TIMER;
+                            state.timerRemainingSecs = state.timerMinutes * 60;
+                        }
+                    } else if (current_view == VIEW_MODE_A) {
+                        state.currentMode = MODE_A_THERMOSTAT;
+                        state.lastSelectedMode = MODE_A_THERMOSTAT;
+                        state.forceEval = true;
+                    } else if (current_view == VIEW_MODE_C) {
+                        state.currentMode = MODE_C_SETPOINT;
+                        state.lastSelectedMode = MODE_C_SETPOINT;
+                        state.forceEval = true;
+                    }
                     saveSettings();
                 }
                 return;
@@ -142,42 +138,50 @@ void touch_ui_loop() {
             // --- CONTROLES VALEURS (+ et -) ---
             // Fonction utilitaire bouton : draw_button(10, y, 60, 40, "-", ...); et (250, y, 60, 40, "+", ...)
             
-            if (current_view == VIEW_MODE_A) { // Mode A (Set 50, Hyst 120)
+            if (current_view == VIEW_MODE_A) {
                 if (is_in_rect(tx, ty, 10, 50, 70, 40)) {
                     state.setpoint -= SETPOINT_STEP;
                     if (state.setpoint < SETPOINT_MIN) state.setpoint = SETPOINT_MIN;
+                    markSettingsDirty();
                 }
                 else if (is_in_rect(tx, ty, 240, 50, 70, 40)) {
                     state.setpoint += SETPOINT_STEP;
                     if (state.setpoint > SETPOINT_MAX) state.setpoint = SETPOINT_MAX;
+                    markSettingsDirty();
                 }
                 else if (is_in_rect(tx, ty, 10, 120, 70, 40)) {
                     state.hysteresis -= HYSTERESIS_STEP;
                     if (state.hysteresis < HYSTERESIS_MIN) state.hysteresis = HYSTERESIS_MIN;
+                    markSettingsDirty();
                 }
                 else if (is_in_rect(tx, ty, 240, 120, 70, 40)) {
                     state.hysteresis += HYSTERESIS_STEP;
                     if (state.hysteresis > HYSTERESIS_MAX) state.hysteresis = HYSTERESIS_MAX;
+                    markSettingsDirty();
                 }
             }
-            else if (current_view == VIEW_MODE_B) { // Mode B (Timer 60)
+            else if (current_view == VIEW_MODE_B) {
                 if (is_in_rect(tx, ty, 10, 60, 70, 40)) {
                     state.timerMinutes -= TIMER_STEP;
                     if (state.timerMinutes < TIMER_MIN) state.timerMinutes = TIMER_MIN;
+                    markSettingsDirty();
                 }
                 else if (is_in_rect(tx, ty, 240, 60, 70, 40)) {
                     state.timerMinutes += TIMER_STEP;
                     if (state.timerMinutes > TIMER_MAX) state.timerMinutes = TIMER_MAX;
+                    markSettingsDirty();
                 }
             }
-            else if (current_view == VIEW_MODE_C) { // Mode C (Set 80)
+            else if (current_view == VIEW_MODE_C) {
                 if (is_in_rect(tx, ty, 10, 80, 70, 40)) {
                     state.setpoint -= SETPOINT_STEP;
                     if (state.setpoint < SETPOINT_MIN) state.setpoint = SETPOINT_MIN;
+                    markSettingsDirty();
                 }
                 else if (is_in_rect(tx, ty, 240, 80, 70, 40)) {
                     state.setpoint += SETPOINT_STEP;
                     if (state.setpoint > SETPOINT_MAX) state.setpoint = SETPOINT_MAX;
+                    markSettingsDirty();
                 }
             }
         }

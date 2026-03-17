@@ -13,6 +13,15 @@ float smoothed_hum = 0.0f;
 bool first_read = true;
 
 uint32_t last_sensor_read = 0;
+uint8_t invalid_read_streak = 0;
+
+static void mark_sensor_error(uint32_t now, const char *reason) {
+    if (!state.sensorError) {
+        state.sensorError = true;
+        state.sensorErrorStartTime = now;
+        Serial.printf("[Sensors] %s\n", reason);
+    }
+}
 
 void sensors_init() {
     Serial.println("[Sensors] Initialisation I2C sur CN1 (SDA:27, SCL:22)");
@@ -22,6 +31,7 @@ void sensors_init() {
         Serial.println("[Sensors] AHT21 trouve et initialise !");
         aht_initialized = true;
         state.sensorError = false;
+        invalid_read_streak = 0;
     } else {
         Serial.println("[Sensors] ERREUR : AHT21 introuvable !");
         aht_initialized = false;
@@ -42,13 +52,10 @@ void sensors_loop() {
             if (aht.begin(&Wire, 0, 0x38)) {
                 aht_initialized = true;
                 state.sensorError = false;
+                invalid_read_streak = 0;
                 Serial.println("[Sensors] AHT21 reconnecte !");
             } else {
-                if (!state.sensorError) {
-                    state.sensorError = true;
-                    state.sensorErrorStartTime = now;
-                    Serial.println("[Sensors] Perte de connexion AHT21 !");
-                }
+                mark_sensor_error(now, "Perte de connexion AHT21 !");
                 return;
             }
         }
@@ -61,6 +68,7 @@ void sensors_loop() {
 
             // Exclusion de valeurs physiquement aberrantes
             if (t > -40.0f && t < 120.0f) {
+                invalid_read_streak = 0;
                 if (first_read) {
                     smoothed_temp = t;
                     smoothed_hum = h;
@@ -79,14 +87,15 @@ void sensors_loop() {
                     Serial.println("[Sensors] Lecture OK, erreur effacee.");
                 }
             } else {
-                Serial.println("[Sensors] Valeurs aberrantes ignorees.");
+                invalid_read_streak++;
+                Serial.printf("[Sensors] Valeurs aberrantes ignorees (%u/3).\n", invalid_read_streak);
+                if (invalid_read_streak >= 3) {
+                    mark_sensor_error(now, "Valeurs AHT21 aberrantes a repetition.");
+                }
             }
         } else {
             Serial.println("[Sensors] Echec de la lecture AHT21.");
-            if (!state.sensorError) {
-                state.sensorError = true;
-                state.sensorErrorStartTime = now;
-            }
+            mark_sensor_error(now, "Echec de la lecture AHT21.");
         }
     }
 }

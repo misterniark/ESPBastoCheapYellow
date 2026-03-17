@@ -2,17 +2,12 @@
 #include <Preferences.h>
 #include "config.h"
 
-extern void espnow_send_command(ESPNowCommand cmd);
-
-// Déclarations externes pour la gestion du bouton BOOT et des alertes
-enum ScreenView { VIEW_MENU, VIEW_MODE_A, VIEW_MODE_B, VIEW_MODE_C, VIEW_ALERT_CONN, VIEW_ALERT_SENSOR };
-extern void change_view(ScreenView view);
-extern int current_view;
-
 // Instanciation de l'état global de l'application
 AppState state = {
     .currentMode = MODE_NONE,
+    .lastSelectedMode = MODE_NONE,
     .isHeating = false,
+    .heatingRequested = false,
     .isLocked = false,
     .relayConnected = false,
     .pingFailures = 0,
@@ -20,28 +15,34 @@ AppState state = {
     .currentHumidity = 0.0f,
     .sensorError = false,
     .sensorErrorStartTime = 0,
+    .sensorAlertAckedTime = 0,
     .setpoint = DEFAULT_SETPOINT,
     .hysteresis = DEFAULT_HYSTERESIS,
     .timerMinutes = DEFAULT_TIMER_MIN,
     .timerRemainingSecs = 0,
+    .modeStopPending = false,
+    .modeStopView = VIEW_MENU,
     .screenAwake = true,
-    .lastActivityTime = 0
+    .lastActivityTime = 0,
+    .forceEval = false
 };
 
 Preferences preferences;
+bool _settingsDirty = false;
+uint32_t _lastSettingsChangeTime = 0;
 
 void loadSettings() {
     preferences.begin("espbasto", false);
     
-    // On lit l'ancien mode pour memoire, mais on DOIT demarrer a OFF
-    preferences.getUChar("mode", MODE_NONE); // Juste pour avancer le curseur interne ou ignorer
     state.currentMode = MODE_NONE;
+    state.lastSelectedMode = (OperatingMode)preferences.getUChar("mode", MODE_NONE);
     
     state.setpoint = preferences.getFloat("setpoint", DEFAULT_SETPOINT);
     state.hysteresis = preferences.getFloat("hysteresis", DEFAULT_HYSTERESIS);
     state.timerMinutes = preferences.getUShort("timer", DEFAULT_TIMER_MIN);
     
     // Validation des limites au cas où des données corrompues seraient lues
+    if (state.lastSelectedMode > MODE_C_SETPOINT) state.lastSelectedMode = MODE_NONE;
     if (state.setpoint < SETPOINT_MIN || state.setpoint > SETPOINT_MAX) state.setpoint = DEFAULT_SETPOINT;
     if (state.hysteresis < HYSTERESIS_MIN || state.hysteresis > HYSTERESIS_MAX) state.hysteresis = DEFAULT_HYSTERESIS;
     if (state.timerMinutes < TIMER_MIN || state.timerMinutes > TIMER_MAX) state.timerMinutes = DEFAULT_TIMER_MIN;
@@ -49,13 +50,54 @@ void loadSettings() {
     preferences.end();
 }
 
+void markSettingsDirty() {
+    _settingsDirty = true;
+    _lastSettingsChangeTime = millis();
+}
+
 void saveSettings() {
+    _settingsDirty = false;
     preferences.begin("espbasto", false);
-    preferences.putUChar("mode", state.currentMode);
+    preferences.putUChar("mode", state.lastSelectedMode);
     preferences.putFloat("setpoint", state.setpoint);
     preferences.putFloat("hysteresis", state.hysteresis);
     preferences.putUShort("timer", state.timerMinutes);
     preferences.end();
+}
+
+bool request_mode_stop(ScreenView nextView) {
+    state.modeStopPending = true;
+    state.modeStopView = nextView;
+
+    if (state.currentMode == MODE_NONE && !state.isHeating && !state.heatingRequested) {
+        finalize_mode_stop();
+        return true;
+    }
+
+    if (espnow_send_command(CMD_HEAT_OFF)) {
+        state.heatingRequested = false;
+        return true;
+    }
+
+    state.modeStopPending = false;
+    state.modeStopView = current_view;
+    return false;
+}
+
+void finalize_mode_stop() {
+    state.currentMode = MODE_NONE;
+    state.timerRemainingSecs = 0;
+    state.modeStopPending = false;
+    saveSettings();
+
+    if (current_view != state.modeStopView) {
+        change_view(state.modeStopView);
+    }
+}
+
+void cancel_mode_stop() {
+    state.modeStopPending = false;
+    state.modeStopView = current_view;
 }
 
 void setup() {
@@ -97,11 +139,15 @@ void loop() {
     uint32_t now = millis();
 
     /* 1. Gestion de la veille de l'écran (Timeout) */
-    if (state.screenAwake && (now - state.lastActivityTime > SCREEN_TIMEOUT_MS)) {
-        state.screenAwake = false;
-        digitalWrite(TFT_BL, LOW); // Eteindre rétroéclairage
-        display_ui_sleep();     // ILI9341 SLPIN command
-        Serial.println("Timeout inactivité : Mise en veille écran");
+    if (state.screenAwake) {
+        if (!display_ui_sleep_hint_active() && (now - state.lastActivityTime > SCREEN_TIMEOUT_MS)) {
+            display_ui_show_sleep_hint();
+        } else if (display_ui_sleep_hint_expired()) {
+            state.screenAwake = false;
+            digitalWrite(TFT_BL, LOW);
+            display_ui_sleep();
+            Serial.println("Timeout inactivité : Mise en veille écran");
+        }
     }
 
     /* 1b. Gestion du bouton BOOT (secours / réveil / acquittement) */
@@ -115,15 +161,21 @@ void loop() {
             display_ui_wake();
             Serial.println("[BOOT] Reveil ecran via BOOT.");
         } else {
+            if (display_ui_sleep_hint_active()) {
+                display_ui_cancel_sleep_hint();
+                state.lastActivityTime = now;
+                return;
+            }
+
             // Si une alerte est affichée, l'acquitter
             if (current_view == VIEW_ALERT_CONN) {
                 state.pingFailures = 0;
                 change_view(VIEW_MENU);
                 Serial.println("[BOOT] Alerte connexion acquittee.");
             } else if (current_view == VIEW_ALERT_SENSOR) {
-                state.sensorError = false;
+                state.sensorAlertAckedTime = now;
                 change_view(VIEW_MENU);
-                Serial.println("[BOOT] Alerte capteur acquittee.");
+                Serial.println("[BOOT] Alerte capteur acquittee (cooldown 60s).");
             }
             state.lastActivityTime = now;
         }
@@ -135,31 +187,29 @@ void loop() {
     sensors_loop();   // Gère le lissage EMA et détecte les erreurs capteurs
     espnow_link_loop(); // Gère ping et réceptions
 
-    /* 2. Logique Thermostat (Évaluation toutes les 60s) */
+    /* 2. Logique Thermostat (Évaluation toutes les 60s ou sur demande) */
     static uint32_t lastThermostatEval = 0;
-    if (now - lastThermostatEval > THERMOSTAT_EVAL_MS) {
+    if (state.forceEval || (now - lastThermostatEval > THERMOSTAT_EVAL_MS)) {
+        state.forceEval = false;
         lastThermostatEval = now;
 
-        if (state.currentMode == MODE_A_THERMOSTAT && !state.sensorError) {
+        if (!state.modeStopPending && state.currentMode == MODE_A_THERMOSTAT && !state.sensorError) {
             float minTemp = state.setpoint - state.hysteresis;
-            if (state.currentTemp < minTemp && !state.isHeating) {
-                espnow_send_command(CMD_HEAT_ON);
-                state.isHeating = true;
-            } else if (state.currentTemp >= state.setpoint && state.isHeating) {
-                espnow_send_command(CMD_HEAT_OFF);
-                state.isHeating = false;
+            if (state.currentTemp < minTemp && !state.heatingRequested) {
+                if (espnow_send_command(CMD_HEAT_ON)) {
+                    state.heatingRequested = true;
+                }
+            } else if (state.currentTemp >= state.setpoint && state.heatingRequested) {
+                request_mode_stop(current_view);
             }
         } 
-        else if (state.currentMode == MODE_C_SETPOINT && !state.sensorError) {
-            if (state.currentTemp < state.setpoint && !state.isHeating) {
-                espnow_send_command(CMD_HEAT_ON);
-                state.isHeating = true;
-            } else if (state.currentTemp >= state.setpoint && state.isHeating) {
-                espnow_send_command(CMD_HEAT_OFF);
-                state.isHeating = false;
-                // Le mode C s'arrête définitivement une fois atteint
-                state.currentMode = MODE_NONE;
-                saveSettings();
+        else if (!state.modeStopPending && state.currentMode == MODE_C_SETPOINT && !state.sensorError) {
+            if (state.currentTemp < state.setpoint && !state.heatingRequested) {
+                if (espnow_send_command(CMD_HEAT_ON)) {
+                    state.heatingRequested = true;
+                }
+            } else if (state.currentTemp >= state.setpoint && state.heatingRequested) {
+                request_mode_stop(current_view);
             }
         }
     }
@@ -168,34 +218,33 @@ void loop() {
     static uint32_t lastTimerTick = 0;
     if (now - lastTimerTick >= 1000) {
         lastTimerTick = now;
-        if (state.currentMode == MODE_B_TIMER && state.timerRemainingSecs > 0) {
+        if (!state.modeStopPending && state.currentMode == MODE_B_TIMER && state.timerRemainingSecs > 0) {
             state.timerRemainingSecs--;
-            if (!state.isHeating) {
-                espnow_send_command(CMD_HEAT_ON);
-                state.isHeating = true;
+            if (!state.heatingRequested) {
+                if (espnow_send_command(CMD_HEAT_ON)) {
+                    state.heatingRequested = true;
+                }
             }
             if (state.timerRemainingSecs == 0) {
-                // Temps écoulé, arrêt du chauffage
-                espnow_send_command(CMD_HEAT_OFF);
-                state.isHeating = false;
-                state.currentMode = MODE_NONE;
-                saveSettings();
+                request_mode_stop(current_view);
             }
         }
     }
 
     /* 4. Gestion Mode Dégradé / Sécurité Capteur */
-    if (state.sensorError && state.isHeating && 
+    if (!state.modeStopPending && state.sensorError && (state.isHeating || state.heatingRequested) && 
        (state.currentMode == MODE_A_THERMOSTAT || state.currentMode == MODE_C_SETPOINT)) {
         
         if (now - state.sensorErrorStartTime >= SENSOR_ERROR_TIMEOUT_MS) {
             Serial.println("⚠ ERREUR CRITIQUE : Temps mode dégradé écoulé (5 min). ARRÊT SÉCURITÉ.");
-            espnow_send_command(CMD_HEAT_OFF);
-            state.isHeating = false;
-            state.currentMode = MODE_NONE;
-            saveSettings();
+            request_mode_stop(current_view);
         }
     }
 
-    delay(10); // Léger retard pour ne pas bloquer Watchdog (Tâche Idle FreeRTOS)
+    /* 5. Sauvegarde différée des réglages +/- */
+    if (_settingsDirty && (now - _lastSettingsChangeTime >= SETTINGS_SAVE_DELAY_MS)) {
+        saveSettings();
+    }
+
+    delay(10);
 }

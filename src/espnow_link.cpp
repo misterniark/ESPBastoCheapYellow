@@ -3,17 +3,17 @@
 #include <esp_now.h>
 #include "config.h"
 
-// Déclaration externe pour forcer le retour au menu en cas de lock
-enum ScreenView { VIEW_MENU, VIEW_MODE_A, VIEW_MODE_B, VIEW_MODE_C, VIEW_ALERT_CONN, VIEW_ALERT_SENSOR };
-extern void change_view(ScreenView view); // dans display_ui.cpp
-extern void saveSettings();
-
 // Variables locales
 uint32_t last_ping_time = 0;
 bool waiting_ack = false;
 uint32_t ack_wait_start = 0;
 uint8_t retry_count = 0;
 ESPNowCommand pending_command;
+static constexpr uint8_t RX_QUEUE_SIZE = 4;
+volatile uint8_t _rx_queue[RX_QUEUE_SIZE] = {0};
+volatile uint8_t _rx_head = 0;
+volatile uint8_t _rx_tail = 0;
+volatile bool _rx_overflow = false;
 
 // Callback envoi
 void OnDataSent(const wifi_tx_info_t *mac_addr, esp_now_send_status_t status) {
@@ -25,55 +25,107 @@ void OnDataSent(const wifi_tx_info_t *mac_addr, esp_now_send_status_t status) {
     }
 }
 
-// Callback reception
+static bool isBroadcastMac(const uint8_t *mac) {
+    const uint8_t broadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    return memcmp(mac, broadcast, sizeof(broadcast)) == 0;
+}
+
+// Callback reception (contexte WiFi task — ne touche que le buffer)
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) {
-    if (len == sizeof(uint8_t)) {
-        ESPNowResponse resp = (ESPNowResponse)incomingData[0];
-        Serial.printf("[ESPNOW] Reponse recue : %d\n", resp);
+    if (len != sizeof(uint8_t)) {
+        return;
+    }
 
-        waiting_ack = false; // L'ACK a ete recu, fin des retries
+    if (!isBroadcastMac(RELAY_MAC) && memcmp(esp_now_info->src_addr, RELAY_MAC, 6) != 0) {
+        return;
+    }
+
+    uint8_t next_head = (uint8_t)((_rx_head + 1) % RX_QUEUE_SIZE);
+    if (next_head == _rx_tail) {
+        _rx_overflow = true;
+        return;
+    }
+
+    _rx_queue[_rx_head] = incomingData[0];
+    _rx_head = next_head;
+}
+
+static ESPNowResponse expectedAckFor(ESPNowCommand cmd) {
+    switch (cmd) {
+        case CMD_HEAT_ON:  return ACK_ON;
+        case CMD_HEAT_OFF: return ACK_OFF;
+        case CMD_PING:     return ACK_PONG;
+        default:           return (ESPNowResponse)0;
+    }
+}
+
+static void processResponse(ESPNowResponse resp) {
+    Serial.printf("[ESPNOW] Reponse recue : %d\n", resp);
+
+    if (!state.relayConnected) {
+        state.relayConnected = true;
+        Serial.println("[ESPNOW] Connexion relais retablie.");
+    }
+
+    bool matched = waiting_ack && (resp == expectedAckFor(pending_command));
+    if (matched) {
+        waiting_ack = false;
         retry_count = 0;
-        
-        // RAZ des compteurs de pannes
-        if (!state.relayConnected) {
-            state.relayConnected = true;
-            Serial.println("[ESPNOW] Connexion relais retablie.");
-        }
-        state.pingFailures = 0;
+    }
 
-        switch (resp) {
-            case ACK_ON:
+    switch (resp) {
+        case ACK_ON:
+            if (matched) {
                 Serial.println("[ESPNOW] Relais confirme : ON");
-                break;
-            case ACK_OFF:
+                state.isHeating = true;
+                state.heatingRequested = true;
+            } else {
+                Serial.println("[ESPNOW] ACK_ON ignore (stale ou hors sequence).");
+            }
+            break;
+        case ACK_OFF:
+            if (matched) {
                 Serial.println("[ESPNOW] Relais confirme : OFF");
-                break;
-            case ACK_PONG:
-                Serial.println("[ESPNOW] Relais confirme : PONG");
-                break;
-            case ACK_LOCKED:
-                Serial.println("[ESPNOW] Relais confirme : VERROUILLE (LOCK)");
-                state.isLocked = true;
-                
-                // Arreter le thermostat/minuteur en cours
-                if (state.currentMode != MODE_NONE) {
-                    state.currentMode = MODE_NONE;
-                    state.timerRemainingSecs = 0;
-                    state.isHeating = false;
-                    saveSettings();
+                state.isHeating = false;
+                state.heatingRequested = false;
+                if (state.modeStopPending) {
+                    finalize_mode_stop();
                 }
-                
-                // Forcer le retour au menu principal
-                change_view(VIEW_MENU);
-                break;
-            case ACK_UNLOCKED:
-                Serial.println("[ESPNOW] Relais confirme : DEVERROUILLE");
-                state.isLocked = false;
-                break;
-            default:
-                Serial.println("[ESPNOW] Reponse inconnue.");
-                break;
-        }
+            } else {
+                Serial.println("[ESPNOW] ACK_OFF ignore (stale ou hors sequence).");
+            }
+            break;
+        case ACK_PONG:
+            Serial.println("[ESPNOW] Relais confirme : PONG");
+            state.pingFailures = 0;
+            break;
+        case ACK_LOCKED:
+            Serial.println("[ESPNOW] Relais confirme : VERROUILLE (LOCK)");
+            state.isLocked = true;
+            state.lastActivityTime = millis();
+            display_ui_cancel_sleep_hint();
+            waiting_ack = false;
+            retry_count = 0;
+            state.modeStopPending = false;
+
+            if (state.currentMode != MODE_NONE) {
+                state.currentMode = MODE_NONE;
+                state.timerRemainingSecs = 0;
+                state.isHeating = false;
+                state.heatingRequested = false;
+                saveSettings();
+            }
+            change_view(VIEW_MENU);
+            break;
+        case ACK_UNLOCKED:
+            Serial.println("[ESPNOW] Relais confirme : DEVERROUILLE");
+            state.isLocked = false;
+            state.lastActivityTime = millis();
+            display_ui_cancel_sleep_hint();
+            break;
+        default:
+            Serial.println("[ESPNOW] Reponse inconnue.");
+            break;
     }
 }
 
@@ -120,9 +172,22 @@ void espnow_link_init() {
     }
     
     Serial.println("[ESPNOW] Init terminee.");
+
+    last_ping_time = millis();
+    espnow_send_command(CMD_PING);
 }
 
-void espnow_send_command(ESPNowCommand cmd) {
+bool espnow_send_command(ESPNowCommand cmd) {
+    if (waiting_ack) {
+        if (pending_command == CMD_PING) {
+            Serial.printf("[ESPNOW] PING abandonne (supersede par cmd %d)\n", cmd);
+        } else {
+            Serial.printf("[ESPNOW] Cmd %d abandonnee (supersede par cmd %d)\n", pending_command, cmd);
+        }
+        waiting_ack = false;
+        retry_count = 0;
+    }
+
     uint8_t payload = (uint8_t)cmd;
     esp_err_t result = esp_now_send(RELAY_MAC, &payload, sizeof(payload));
 
@@ -132,13 +197,27 @@ void espnow_send_command(ESPNowCommand cmd) {
         waiting_ack = true;
         ack_wait_start = millis();
         retry_count = 0;
+        return true;
     } else {
-        Serial.println("[ESPNOW] Erreur à l'envoi de la commande.");
+        Serial.println("[ESPNOW] Erreur a l'envoi de la commande.");
+        return false;
     }
 }
 
 void espnow_link_loop() {
     uint32_t now = millis();
+
+    // Traitement thread-safe des réponses bufferisées
+    while (_rx_tail != _rx_head) {
+        ESPNowResponse resp = (ESPNowResponse)_rx_queue[_rx_tail];
+        _rx_tail = (uint8_t)((_rx_tail + 1) % RX_QUEUE_SIZE);
+        processResponse(resp);
+    }
+
+    if (_rx_overflow) {
+        _rx_overflow = false;
+        Serial.println("[ESPNOW] Attention: file RX pleine, au moins une reponse a ete perdue.");
+    }
 
     // Gestion de l'ACK et retry
     if (waiting_ack) {
@@ -152,16 +231,21 @@ void espnow_link_loop() {
                 esp_now_send(RELAY_MAC, &payload, sizeof(payload));
                 ack_wait_start = now;
             } else {
-                Serial.println("[ESPNOW] Timeout de la commande (3 retries echooues).");
+                Serial.println("[ESPNOW] Timeout de la commande (3 retries echoues).");
                 waiting_ack = false;
                 
-                // Increment des echecs de ping *uniquement* si c'etait un CMD_PING
                 if (pending_command == CMD_PING) {
                     state.pingFailures++;
                     if (state.pingFailures >= 3) {
                         state.relayConnected = false;
                         Serial.println("[ESPNOW] ALERTE : Connexion Relais Perdue !");
                     }
+                } else if (pending_command == CMD_HEAT_ON || pending_command == CMD_HEAT_OFF) {
+                    if (pending_command == CMD_HEAT_OFF) {
+                        cancel_mode_stop();
+                    }
+                    state.heatingRequested = state.isHeating;
+                    Serial.printf("[ESPNOW] Intention chauffage reconciliee avec etat confirme (%d)\n", state.isHeating);
                 }
             }
         }
