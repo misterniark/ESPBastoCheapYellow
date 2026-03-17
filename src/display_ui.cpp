@@ -298,6 +298,8 @@ void display_ui_wake() {
     state.screenAwake = true;
     state.lastActivityTime = millis();
     sleep_hint_active = false;
+    tft.fillScreen(COLOR_BG);
+    last_ui_update = 0;
     force_redraw = true;
 }
 
